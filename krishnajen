@@ -9,3 +9,9 @@ pods
 replicas
 services
 asg
+pods
+replicas
+deployments
+name space
+name
+lal
