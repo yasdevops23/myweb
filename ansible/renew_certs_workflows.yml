@@ -1,0 +1,81 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    hclnow_config_client_env: "/path/to/clients"  # base directory containing client envs
+    default_support_org: "ExampleOrg"
+    awx_renew_certs_aws_tickets: {}
+    awx_renew_certs_tickets: {}
+  tasks:
+    - name: Initialize facts
+      set_fact:
+        workflow_nodes: []
+        awx_workflow_certs: []
+        counter: 1
+
+    - name: Discover client environments
+      find:
+        paths: "{{ hclnow_config_client_env }}"
+        file_type: directory
+        depth: 1
+      register: client_dirs
+
+    - name: Loop over clients
+      vars:
+        client: "{{ item.path | basename }}"
+      loop: "{{ client_dirs.files }}"
+      block:
+        - name: Find environments for client
+          find:
+            paths: "{{ item.path }}"
+            file_type: directory
+            depth: 1
+          register: env_dirs
+
+        - name: Loop over envs for client
+          vars:
+            awx_client_code: "{{ client }}"
+          loop: "{{ env_dirs.files }}"
+          loop_control:
+            loop_var: env_item
+          block:
+            - name: Determine paths
+              set_fact:
+                awx_client_env: "{{ env_item.path | basename }}"
+                client_env_path_aws: "{{ env_item.path }}/aws-client-vars-env.yml"
+                client_env_path_g: "{{ env_item.path }}/gcp-client-vars-env.yml"
+                default_path_aws: "{{ item.path }}/aws-client-vars.yml"
+                default_path_gcp: "{{ item.path }}/gcp-client-vars.yml"
+
+            - name: Choose provider and read vars
+              set_fact:
+                cloud_provider: "{{ 'aws' if lookup('file', client_env_path_aws, errors='ignore') else 'gcp' }}"
+                client_env_path: "{{ cloud_provider == 'aws' and client_env_path_aws or client_env_path_g }}"
+                default_path: "{{ cloud_provider == 'aws' and default_path_aws or default_path_gcp }}"
+                refresh_cert: "{{ (lookup('template', client_env_path, errors='ignore', variable_start_string='[%', variable_end_string='%]') | from_yaml).refresh_certs | default(false) }}"
+              when: env_item.state == 'directory'
+
+            - name: Skip if refresh_cert is false
+              when: not refresh_cert
+              debug:
+                msg: "Skipping {{ client }}/{{ awx_client_env }} - refresh_certs not enabled"
+
+            - name: Add workflow node
+              when: refresh_cert
+              set_fact:
+                workflow_nodes: "{{ workflow_nodes + [{'identifier': 'node-' ~ counter, 'inventory': 'inventory_client_' ~ client ~ '_' ~ awx_client_env, 'unified_job_template': {'name': (cloud_provider == 'aws') | ternary('Import Certificate to ACM in AWS', 'Create certs for a client'), 'type': 'job_template'}, 'extra_data': {}, 'cloud_provider': cloud_provider}] }}"
+                counter: "{{ counter + 1 }}"
+
+        - name: Group workflow_nodes by cloud_provider
+          when: workflow_nodes | length > 0
+          set_fact:
+            grouped_nodes: "{{ workflow_nodes | groupby('cloud_provider') | map('list') | list }}"
+
+        - name: Create workflows per provider
+          when: workflow_nodes | length > 0
+          set_fact:
+            awx_workflow_certs: "{{ awx_workflow_certs + [{'name': 'Renew certs for ' ~ client ~ ' ' ~ item.0, 'organization': default_support_org, 'workflow_nodes': item.1}] }}"
+          loop: "{{ grouped_nodes }}"
+
+    - name: Show resulting workflows
+      debug:
+        var: awx_workflow_certs
